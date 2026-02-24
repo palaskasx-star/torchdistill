@@ -416,6 +416,85 @@ class PKTLoss(nn.Module):
         return self.cosine_similarity_loss(student_penultimate_outputs, teacher_penultimate_outputs)
 
 
+@register_loss
+class DecoupledPKTLoss(nn.Module):
+    """
+    Decoupled Probabilistic Knowledge Transfer (DPKT)
+    Combines PKT's feature-space similarity with DKD's decoupling logic.
+    """
+    def __init__(self, alpha=1.0, beta=8.0, temperature=1.0, eps=1e-7):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.temperature = temperature
+        self.eps = eps
+
+    def forward(self, student_features, teacher_features, targets, *args, **kwargs):
+        batch_size = targets.size(0)
+        
+        # 1. Normalize features to compute cosine similarity
+        norm_s = F.normalize(student_features, p=2, dim=1)
+        norm_t = F.normalize(teacher_features, p=2, dim=1)
+        
+        # Calculate raw pairwise cosine similarities (Acts as our "logits")
+        # Shape: (batch_size, batch_size)
+        sim_s = torch.mm(norm_s, norm_s.t())
+        sim_t = torch.mm(norm_t, norm_t.t())
+        
+        # 2. Create Masks
+        # Identity mask: We don't want to compare an image to itself
+        self_mask = torch.eye(batch_size, device=targets.device).bool()
+        
+        # Same-class mask: True if two DIFFERENT images share the same label
+        same_class_mask = (targets.unsqueeze(1) == targets.unsqueeze(0))
+        same_class_mask = same_class_mask & ~self_mask 
+        
+        # 3. Mask out self-similarity (subtract 1000 so softmax makes it 0)
+        sim_s_masked = sim_s / self.temperature - 1000.0 * self_mask
+        sim_t_masked = sim_t / self.temperature - 1000.0 * self_mask
+
+        # Calculate base probability distributions over the batch
+        pred_s = F.softmax(sim_s_masked, dim=1)
+        pred_t = F.softmax(sim_t_masked, dim=1)
+
+        # ==========================================
+        # 4. SCKD: Same-Class Knowledge Distillation
+        # ==========================================
+        # Sum the probabilities of all positive pairs (same class) in the batch
+        p_same_s = torch.sum(pred_s * same_class_mask, dim=1, keepdim=True)
+        p_same_t = torch.sum(pred_t * same_class_mask, dim=1, keepdim=True)
+        
+        # Clamp to avoid log(0) if a batch has no positive pairs for a specific class
+        p_same_s = torch.clamp(p_same_s, self.eps, 1.0 - self.eps)
+        p_same_t = torch.clamp(p_same_t, self.eps, 1.0 - self.eps)
+        
+        # Binary distribution: [Prob of Same Class, Prob of Different Class]
+        prob_s_binary = torch.cat([p_same_s, 1.0 - p_same_s], dim=1)
+        prob_t_binary = torch.cat([p_same_t, 1.0 - p_same_t], dim=1)
+        
+        sckd_loss = F.kl_div(torch.log(prob_s_binary), prob_t_binary, reduction='batchmean')
+
+        # ==============================================
+        # 5. DCKD: Different-Class Knowledge Distillation
+        # ==============================================
+        # Mask out both self-similarity AND same-class similarity
+        # This forces the network to learn the nuanced distances between DIFFERENT classes
+        combined_mask = self_mask | same_class_mask
+        
+        log_prob_diff_s = F.log_softmax(sim_s / self.temperature - 1000.0 * combined_mask, dim=1)
+        prob_diff_t = F.softmax(sim_t / self.temperature - 1000.0 * combined_mask, dim=1)
+        
+        dckd_loss = F.kl_div(log_prob_diff_s, prob_diff_t, reduction='batchmean')
+
+        # ==========================================
+        # 6. Combine Loss
+        # ==========================================
+        # If the batch size is too small or classes are unique, SCKD might be noisy, 
+        # so alpha and beta tuning is important here.
+        loss = (self.alpha * sckd_loss + self.beta * dckd_loss) * (self.temperature ** 2)
+        
+        return loss
+
 @register_mid_level_loss
 class FTLoss(nn.Module):
     """
